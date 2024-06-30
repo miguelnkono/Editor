@@ -1,7 +1,8 @@
-/// Left at " Hide the cursor when repainting. "
-
-
 /*** includes ***/
+
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
 
 #include <ctype.h>
 #include <errno.h>
@@ -9,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -33,11 +35,21 @@ enum editorKey {
 
 /*** data ***/
 
+// Data type to store a row of text.
+typedef struct erow {
+    int size;
+    char *chars;
+} erow;
+
 /// struct that is going to all our editor state.
 struct editorConfig {
     int cx, cy;
+    int rowoff;
+    int coloff;
     int screenrows;
     int screencols;
+    int numrows;
+    erow *row;
     struct termios orig_termios;  // For low-level stuff "Raw Mode"
 };
 
@@ -161,6 +173,43 @@ int getWindowSize(int *rows, int *cols) {
     }
 }
 
+/*** row operations ***/
+
+void editorAppendRow(char *s, size_t len) {
+    E.row = realloc(E.row, sizeof(erow) *(E.numrows + 1));
+
+    int at = E.numrows;
+    E.row[at].size = len;
+    E.row[at].chars = malloc(len + 1);
+    memcpy(E.row[at].chars, s, len);
+    E.row[at].chars[len] = '\0';
+    E.numrows++;
+}
+
+/*** file i/o ***/
+
+void editorOpen(char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) die("fopen");
+    
+
+    char *line = NULL;
+    size_t linecap = 0;
+    ssize_t linelen;
+    //linelen = getline(&line, &linecap, fp); 
+    // read a line in fp.
+    while ((linelen = getline(&line, &linelen, fp)) != -1) {
+        // We remove the '\n' and '\r'
+        while(linelen > 0 && 
+                (line[linelen - 1] == '\n' ||
+                 line[linelen - 1] == '\r'))
+            linelen--;
+        editorAppendRow(line, linelen);
+    }
+    free(line);
+    fclose(fp);
+}
+
 /*** append buffer ***/
 
 struct abuf {
@@ -190,28 +239,52 @@ void abFree(struct abuf *ab)
 
 /*** output ***/
 
+/// To be able to scroll.
+void editorScroll() {
+    if (E.cy < E.rowoff) {
+        E.rowoff = E.cy;
+    }
+    if (E.cy >= E.rowoff + E.screenrows) {
+        E.rowoff = E.cy - E.screenrows + 1;
+    }
+
+    if (E.cx < E.coloff) {
+        E.coloff = E.cx;
+    }
+    if (E.cx >= E.coloff + E.screencols) {
+        E.coloff = E.cx - E.screencols + 1;
+    }
+}
+
 /// To draw tidles on the left hand side of the screen.
 void editorDrawRows(struct abuf *ab) {
     int y;
     for(y = 0; y < E.screenrows; y++) {
-        //abAppend(ab, "~",  1);
-        
-        if (y == E.screenrows / 3) {
-            char welcome[80];
-            int welcomelen = snprintf(welcome, sizeof(welcome), 
+        int filerow = y + E.rowoff;
+        if (filerow >= E.numrows) {
+            // Display the welcome message only if the user
+            // open the editor without any argument as input.
+            if (E.numrows == 0 && y == E.screenrows / 3) {
+                char welcome[80];
+                int welcomelen = snprintf(welcome, sizeof(welcome), 
                     "KILO editor -- version %s", KILO_VERSION);
-            if (welcomelen > E.screencols) welcomelen = E.screencols;
+                if (welcomelen > E.screencols) welcomelen = E.screencols;
             
-            int padding = (E.screencols - welcomelen) / 2;
-            if (padding) {
+                int padding = (E.screencols - welcomelen) / 2;
+                if (padding) {
+                    abAppend(ab, "~", 1);
+                    padding--;
+                }
+                while(padding--) abAppend(ab, " ", 1);
+                abAppend(ab, welcome, welcomelen);
+            } else 
+            {
                 abAppend(ab, "~", 1);
-                padding--;
             }
-            while(padding--) abAppend(ab, " ", 1);
-            abAppend(ab, welcome, welcomelen);
-        } else 
-        {
-            abAppend(ab, "~", 1);
+        } else {
+           int len = E.row[filerow].size - E.coloff;
+           if (len < 0) len = 0;
+           abAppend(ab, &E.row[filerow].chars[E.coloff], len);
         }
 
         //<esc>[K -> clear one line at the time.
@@ -223,6 +296,8 @@ void editorDrawRows(struct abuf *ab) {
 }
 
 void editorRefreshScreen() {
+    editorScroll();
+
     struct abuf ab = ABUF_INIT;
 
     /// (h, l) commands are used to turn on and turn off varius terminal features or "modes".
@@ -239,7 +314,9 @@ void editorRefreshScreen() {
     // Move the cursor to the position stored in E.cx and E.cy.
     // \x1b[H is for the cursor.
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", 
+            (E.cy - E.rowoff) + 1, 
+            (E.cx - E.coloff) + 1);
     abAppend(&ab, buf, strlen(buf));
 
     //abAppend(&ab, "\x1b[H", 3);
@@ -261,9 +338,10 @@ void editorMoveCursor(int key) {
             break;
 
         case ARROW_RIGHT:
-            if (E.cx != E.screencols - 1){
+            /*if (E.cx != E.screencols - 1){
                 E.cx++;
-            }
+            }*/
+            E.cx++;
             break;
 
         case ARROW_UP:
@@ -273,7 +351,7 @@ void editorMoveCursor(int key) {
             break;
 
         case ARROW_DOWN:
-            if (E.cy != E.screenrows - 1) {
+            if (E.cy < E.numrows) {
                 E.cy++;
             }
             break;
@@ -325,26 +403,21 @@ void editorProcessKeypress() {
 void initEditor() {
     E.cx = 0;
     E.cy = 0;
+    E.rowoff = 0;
+    E.coloff = 0;
+    E.numrows = 0;
+    E.row = NULL;
 
     if (getWindowSize(&E.screenrows, &E.screencols) == -1)
         die("getWindowSize");
 }
 
-/*void editorProcessKeypress() {
-    char c = editorReadKey();
-
-    switch(c) {
-        case CTRL_KEY('q'):
-            write(STDOUT_FILENO, "\x1b[2J", 4);
-            write(STDOUT_FILENO, "\x1b[H", 3);
-            exit(1);
-            break;
-    }
-}*/
-
-int main() {
+int main(int argc, char *argv[]) {
     enableRawMode();
     initEditor();
+    if (argc >= 2) {
+        editorOpen(argv[1]);
+    }
 
     while(1) {
         editorRefreshScreen();
