@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -18,13 +19,14 @@
 
 /*** defines ***/
 
-#define KILO_VERSION "0.0.3"
+#define KILO_VERSION "0.0.4"
 #define KILO_TAB_STOP 8
 
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 // Directions Keys.
 enum editorKey {
+    BACKSPACE = 127 ,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -40,10 +42,10 @@ enum editorKey {
 
 // Data type to store a row of text.
 typedef struct erow {
-    int size;
-    int rsize;
-    char *chars;
-    char *render;
+    int size;       // The length of the row
+    int rsize;      // the length of the caractere to render
+    char *chars;    // the caractere which is on the line
+    char *render;   // the caractere to render on the screen
 } erow;
 
 /// struct that is going to all our editor state.
@@ -61,9 +63,14 @@ struct editorConfig {
     struct termios orig_termios;  // For low-level stuff "Raw Mode"
 };
 
+// The state of the editor.
 struct editorConfig E;
 
+/*** prototypes  ***/
+void editorSetStatusMessage(const char *fmt, ...);
+
 /*** terminal ***/
+
 void die(const char *s) {
     write(STDOUT_FILENO, "\x1b[2J", 4);
     write(STDOUT_FILENO, "\x1b[1;1H", 3);
@@ -201,6 +208,7 @@ void editorUpdateRow(erow *row)
 {
     int tabs = 0;
     int j;
+    // Check for tab.
     for (j = 0; j < row->size; j++) {
         if (row->chars[j] == '\t') tabs++;
     }
@@ -241,9 +249,80 @@ void editorAppendRow(char *s, size_t len) {
     E.numrows++;
 }
 
-/*** file i/o ***/
+/*
+* A function to insert a single character at a given position into a erow. 
+* params : 
+*   at -> the position where to insert
+*   c -> the caracter to insert
+*   row -> the row to insert into.
+*/
+void editorRowInsertChar (erow *row, int at, int c)
+{
+    // Check than we don't insert at wrong position.
+    if (at < 0 || at > row->size)
+    {
+        at = row->size;
+    }
 
-void editorOpen(char *filename) {
+    // Change the lenght of the row data.
+    row->chars = realloc(row->chars, row->size + 2);
+    // Move the text forward by one.
+    memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+    // Update the lenght of the line.
+    row->size++;
+    // Put the caracter.
+    row->chars[at] = c;
+    editorUpdateRow(row);
+}
+
+/* editor operations. */
+/*
+ * A function to be call in editorProcessKeypress() to insert a character.
+ * params :
+ *  c -> the caracter to be insert.
+ */
+void editorInsertChar (int c)
+{
+    // Add a new line if neccesary.
+    if (E.cy == E.numrows)
+    {
+        editorAppendRow("", 0);
+    }
+    // Insert the caracter c at the E.cx of line E.row[E.cy].
+    editorRowInsertChar(&E.row[E.cy], E.cx, c);
+    // Increment the number of the column.
+    E.cx++;
+}
+
+/*** file i/o ***/
+/*
+ * Function to convert our array of erow into a single big string so than we can save it to the disk.
+ */
+char *editorRowsToString(int *buflen)
+{
+    int totlen = 0; // to compute the total amount of the caracters.
+    int j;
+
+    for (j = 0; j < E.numrows; j++)
+        totlen += E.row[j].size + 1;
+    *buflen = totlen;
+
+    char *buf = malloc(totlen);
+    char *p = buf;  // [p] point to [buf]
+
+    for (j = 0; j < E.numrows; j++)
+    {
+        memcpy(p, E.row[j].chars, E.row[j].size);
+        p += E.row[j].size;
+        *p = '\n';
+        p++;
+    }
+
+    return buf;
+}
+
+void editorOpen(char *filename)
+{
     free(E.filename);
     E.filename = strdup(filename);
 
@@ -266,6 +345,44 @@ void editorOpen(char *filename) {
     }
     free(line);
     fclose(fp);
+}
+
+/*
+* Function to save the content of the file on the disk.
+*/
+void editorSave()
+{
+    if (E.filename == NULL)
+        return;
+
+    int len;
+    char *buf = editorRowsToString(&len);
+
+    // Open the store in E.filename.
+    // O_CREAT -> To create a new file if it's doesn't already exist.
+    // O_RDWR -> Open the file for reading and writing.
+    // [0644] -> Give permission to the owner of the file to read and write into the file, for the others they just have the permision to read.
+    int fd = open(E.filename, O_RDWR || O_CREAT, 0644);
+    if (fd != -1)
+    {
+        // Set the file's size to the specified length.
+        if (ftruncate(fd, len) != -1)
+        {
+            // Write the content of [buf] into [fd]
+            if (write(fd, buf, len) == len)
+            {
+                // Close [fd]
+                close(fd);
+                // Free the memory allocate by but.
+                free(buf);
+                editorSetStatusMessage("%d bytes written to disk", len);
+                return;
+            }
+        }
+        close(fd);
+    }
+    free(buf);
+    editorSetStatusMessage("Can't save I/O error: %s", strerror(errno));
 }
 
 /*** append buffer ***/
@@ -488,10 +605,19 @@ void editorProcessKeypress() {
     int c = editorReadKey();
 
     switch(c) {
+        // The ENTER key.
+        case '\r':
+            /* TODO */
+            break;
+
         case CTRL_KEY('q'):
             write(STDOUT_FILENO, "\x1b[2J", 4);
             write(STDOUT_FILENO, "\x1b[H", 3);
             exit(1);
+            break;
+
+        case CTRL_KEY('s'):
+            editorSave();
             break;
 
             /* For now we simplt make the HOME_KEY and the
@@ -504,6 +630,13 @@ void editorProcessKeypress() {
             //E.cx = E.screencols - 1;
             if (E.cy < E.numrows)
                 E.cx = E.row[E.cy].size;
+            break;
+
+        // All handle the behavior of backspace.
+        case BACKSPACE:
+        case CTRL_KEY('h'):
+        case DEL_KEY:
+            /* TODO */
             break;
 
             /* For now PAGE_UP and PAGE_DOWN simply move the
@@ -533,7 +666,17 @@ void editorProcessKeypress() {
         case ARROW_RIGHT:
             editorMoveCursor(c);
             break;
-    }
+
+        // Ctlr + l is traditional use to refresh the screen of terminal programs.
+        case CTRL_KEY('l'):
+        case '\x1b':
+            /* TODO */
+            break;
+
+        default:
+            editorInsertChar(c);
+            break;
+        }
 }
 
 /*** init ***/
@@ -562,7 +705,7 @@ int main(int argc, char *argv[]) {
         editorOpen(argv[1]);
     }
 
-    editorSetStatusMessage("HELP: Ctrl-Q = quit");
+    editorSetStatusMessage("HELP:Ctrl-S = save | Ctrl-Q = quit");
 
     while(1) {
         editorRefreshScreen();
